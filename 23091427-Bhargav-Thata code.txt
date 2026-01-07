@@ -1,0 +1,1246 @@
+---------config.py file
+
+from pathlib import Path
+
+PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
+
+# NEW — directories (compatibility with older imports)
+DATA_DIR = PROJECT_ROOT / "data"          # <- NEW
+RAW_DIR = DATA_DIR / "raw"                # <- NEW
+
+# CSV path used by the pipeline
+DATA_RAW: Path = RAW_DIR / "Phishing_Legitimate_full.csv"
+
+# Outputs
+OUTPUT_DIR: Path = PROJECT_ROOT / "outputs"
+FIG_DIR: Path = OUTPUT_DIR / "figures"
+ARTIFACTS_DIR: Path = OUTPUT_DIR / "artifacts"
+
+# Reproducibility / config
+RANDOM_STATE: int = 42
+N_JOBS: int = -1
+ID_COL = "id"
+TARGET_COL = "CLASS_LABEL"  # 0=legit, 1=phish
+N_FOLDS = 5
+FIG_DPI = 120
+
+
+
+
+
+---------data.py file
+
+from pathlib import Path
+import pandas as pd
+from .config import DATA_RAW, ID_COL, TARGET_COL
+
+def load_dataset(csv_path: Path = DATA_RAW) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    # Clean up common issues
+    if ID_COL in df.columns:
+        df = df.drop(columns=[ID_COL])
+    # Ensure target is int/binary (0,1)
+    if df[TARGET_COL].dtype != int:
+        df[TARGET_COL] = df[TARGET_COL].astype(int)
+    return df
+
+def train_test_split_stratified(df: pd.DataFrame, test_size: float = 0.2, random_state: int = 42):
+    from sklearn.model_selection import train_test_split
+    X = df.drop(columns=[TARGET_COL])
+    y = df[TARGET_COL]
+    return train_test_split(X, y, test_size=test_size, stratify=y, random_state=random_state)
+
+def describe_dataset(df: pd.DataFrame) -> dict:
+    return {
+        "shape": df.shape,
+        "columns": df.columns.tolist(),
+        "class_balance": df[TARGET_COL].value_counts(normalize=True).round(3).to_dict()
+    }
+
+
+
+-----evaluate.py file
+
+from pathlib import Path
+from typing import Dict, Tuple
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import (classification_report, confusion_matrix, roc_curve, auc,
+                             precision_recall_curve)
+from .config import FIG_DIR, FIG_DPI
+
+def evaluate_holdout(models: Dict[str, any], X_test, y_test) -> Dict:
+    results = {}
+    for name, pipe in models.items():
+        y_pred = pipe.predict(X_test)
+        y_proba = pipe.predict_proba(X_test)[:, 1] if hasattr(pipe, "predict_proba") else None
+        report = classification_report(y_test, y_pred, output_dict=True, digits=4)
+        cm = confusion_matrix(y_test, y_pred).tolist()
+        results[name] = {"report": report, "confusion_matrix": cm}
+        if y_proba is not None:
+            fpr, tpr, _ = roc_curve(y_test, y_proba)
+            results[name]["roc"] = {"fpr": fpr.tolist(), "tpr": tpr.tolist(), "auc": float(auc(fpr, tpr))}
+    return results
+
+def plot_rocs(models: Dict[str, any], X_test, y_test, out_path: Path):
+    plt.figure(figsize=(6,5), dpi=FIG_DPI)
+    for name, pipe in models.items():
+        if not hasattr(pipe, "predict_proba"):
+            continue
+        y_proba = pipe.predict_proba(X_test)[:, 1]
+        fpr, tpr, _ = roc_curve(y_test, y_proba)
+        plt.plot(fpr, tpr, label=f"{name} (AUC={auc(fpr,tpr):.3f})")
+    plt.plot([0,1],[0,1],"--")
+    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate"); plt.title("ROC Curves")
+    plt.legend(); plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path); plt.close()
+
+def plot_confusion_matrix(cm: np.ndarray, labels: Tuple[str,str], out_path: Path):
+    import seaborn as sns
+    plt.figure(figsize=(4.2,3.6), dpi=FIG_DPI)
+    sns.heatmap(cm, annot=True, fmt="d", cbar=False, xticklabels=labels, yticklabels=labels)
+    plt.xlabel("Predicted"); plt.ylabel("Actual"); plt.title("Confusion Matrix")
+    plt.tight_layout(); out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path); plt.close()
+
+def plot_precision_recall_thresholds(model, X_test, y_test, out_path: Path):
+    y_proba = model.predict_proba(X_test)[:, 1]
+    precision, recall, thresholds = precision_recall_curve(y_test, y_proba)
+    plt.figure(figsize=(6,5), dpi=FIG_DPI)
+    plt.plot(thresholds, precision[:-1], label="Precision")
+    plt.plot(thresholds, recall[:-1], label="Recall")
+    plt.xlabel("Threshold"); plt.ylabel("Score")
+    plt.title("Precision/Recall vs Decision Threshold (Best Model)")
+    plt.legend(); plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path); plt.close()
+
+
+
+-----explain.py file
+
+from pathlib import Path
+from typing import Optional, Union
+import numpy as np
+import shap
+import matplotlib.pyplot as plt
+from sklearn.pipeline import Pipeline
+from .config import FIG_DPI
+
+# helpers
+
+def _is_tree_model(estimator) -> bool:
+    """Heuristic: True if the estimator looks tree/ensemble-based."""
+    return hasattr(estimator, "estimators_") or hasattr(estimator, "feature_importances_")
+
+
+def _expected_value_for_class(expected_value, class_index: int = 1):
+    """Return scalar expected value for the requested class (handles list/array/scalar)."""
+    if isinstance(expected_value, (list, tuple, np.ndarray)):
+        idx = min(class_index, len(expected_value) - 1)
+        return float(expected_value[idx])
+    return float(expected_value)
+
+
+def _select_class_array(shap_values: Union[list, np.ndarray], class_index: int = 1) -> np.ndarray:
+    """
+    Normalize SHAP outputs to a 2-D array of shape (n_samples, n_features) for the given class.
+    Handles:
+      - list[len=n_classes] of arrays (n_samples, n_features)
+      - array (n_samples, n_features)
+      - array (n_samples, n_features, n_classes)
+    """
+    if isinstance(shap_values, list):
+        # Standard tree path: list per class
+        arr = np.asarray(shap_values[class_index])
+    else:
+        arr = np.asarray(shap_values)
+
+    if arr.ndim == 3:
+        # (n_samples, n_features, n_classes) -> take class_index
+        arr = arr[..., min(class_index, arr.shape[-1] - 1)]
+    elif arr.ndim == 1:
+        # single sample (n_features,) -> keep as 2-D for consistent indexing later
+        arr = arr[None, :]
+    return arr
+
+
+# public API
+
+def shap_summary_plots(best_name: str, best_model: Pipeline, X_sample, out_prefix: Path) -> None:
+    """
+    Generate SHAP summary plots (beeswarm + bar) for a sample of data.
+    Saves: <prefix>_summary.png and <prefix>_bar.png
+    """
+    estimator = best_model.named_steps["clf"]
+    prep = best_model.named_steps["prep"]
+
+    # Transform features once; SHAP works on numeric array
+    X_trans = prep.transform(X_sample)
+
+    if _is_tree_model(estimator):
+        explainer = shap.TreeExplainer(estimator, feature_perturbation="interventional")
+        raw_sv = explainer.shap_values(X_trans)
+        sv = _select_class_array(raw_sv, class_index=1)
+    else:
+        # KernelExplainer can be slow; keep small background + sample
+        bg = X_trans[: min(100, X_trans.shape[0])]
+        f = lambda Z: best_model.predict_proba(Z)[:, 1]
+        explainer = shap.KernelExplainer(f, bg)
+        sv = np.asarray(explainer.shap_values(X_trans[: min(500, X_trans.shape[0])]))
+        X_trans = X_trans[: sv.shape[0]]
+
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+
+    # Beeswarm
+    plt.figure(dpi=FIG_DPI)
+    shap.summary_plot(sv, X_trans, show=False)
+    plt.tight_layout()
+    plt.savefig(out_prefix.with_name(out_prefix.name + "_summary.png"))
+    plt.close()
+
+    # Bar
+    plt.figure(dpi=FIG_DPI)
+    shap.summary_plot(sv, X_trans, plot_type="bar", show=False)
+    plt.tight_layout()
+    plt.savefig(out_prefix.with_name(out_prefix.name + "_bar.png"))
+    plt.close()
+
+
+def shap_single_waterfalls(best_model: Pipeline, X_test, y_test, out_prefix: Path) -> None:
+    """
+    Save two per-instance SHAP waterfall plots:
+      - most confident phishing (class=1)
+      - most confident legitimate (class=0)
+    Saves: <prefix>_phishing.png and <prefix>_legitimate.png
+    """
+    estimator = best_model.named_steps["clf"]
+    prep = best_model.named_steps["prep"]
+
+    # Transform test features for explainer/model
+    X_trans = prep.transform(X_test)
+
+    # Choose the representative indices by probability of class=1
+    proba1 = best_model.predict_proba(X_test)[:, 1]
+    phishing_idx = int(np.argmax(proba1))
+    legit_idx = int(np.argmin(proba1))
+
+    if _is_tree_model(estimator):
+        explainer = shap.TreeExplainer(estimator, feature_perturbation="interventional")
+        raw_sv = explainer.shap_values(X_trans)
+        sv_class1 = _select_class_array(raw_sv, class_index=1)
+        base_value = _expected_value_for_class(explainer.expected_value, class_index=1)
+    else:
+        # Non-tree models → KernelExplainer (explain only the 2 points to be quick)
+        bg = X_trans[: min(100, X_trans.shape[0])]
+        f = lambda Z: best_model.predict_proba(Z)[:, 1]
+        explainer = shap.KernelExplainer(f, bg)
+        idxs = [phishing_idx, legit_idx]
+        sv = np.asarray(explainer.shap_values(X_trans[idxs]))
+        # sv shape -> (2, n_features); normalize to (n_samples, n_features)
+        if sv.ndim == 1:
+            sv = sv[None, :]
+        sv_class1 = sv
+        base_value = float(explainer.expected_value)
+
+    # Optional: nice feature names
+    try:
+        feature_names = list(X_test.columns)
+    except Exception:
+        feature_names = None
+
+    def _save(idx: int, label: str):
+        # values: 1-D (n_features,)
+        if sv_class1.ndim != 2:
+            raise ValueError(f"Unexpected SHAP shape: {sv_class1.shape}")
+        values = sv_class1[idx if sv_class1.shape[0] > idx else 0]
+        exp = shap.Explanation(
+            values=values,
+            base_values=base_value,
+            data=X_trans[idx],
+            feature_names=feature_names,
+        )
+        shap.plots.waterfall(exp, show=False)
+        out = out_prefix.with_name(out_prefix.name + f"_{label}.png")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        plt.tight_layout()
+        plt.savefig(out, dpi=150)
+        plt.close()
+
+    _save(phishing_idx, "phishing")
+    _save(legit_idx, "legitimate")
+
+
+
+
+-----main.py file
+
+from pathlib import Path
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.metrics import confusion_matrix
+from .config import OUTPUT_DIR, FIG_DIR, ARTIFACTS_DIR, RANDOM_STATE, TARGET_COL
+from .utils import ensure_dir, save_json
+from .data import load_dataset, train_test_split_stratified, describe_dataset
+from .modeling import build_preprocessor, fit_all, cv_scores, tree_rules_text
+from .evaluate import evaluate_holdout, plot_rocs, plot_confusion_matrix, plot_precision_recall_thresholds
+from .explain import shap_summary_plots, shap_single_waterfalls
+
+def main():
+    # Prepare folders
+    for p in [OUTPUT_DIR, FIG_DIR, ARTIFACTS_DIR]:
+        ensure_dir(p)
+
+    # Load data
+    df = load_dataset()
+    meta = describe_dataset(df)
+    print("DATA SUMMARY:", meta)
+
+    # Split
+    X_train, X_test, y_train, y_test = train_test_split_stratified(df, test_size=0.2, random_state=RANDOM_STATE)
+    preprocessor = build_preprocessor(X_train)
+
+    # Fit models
+    models = fit_all(X_train, y_train, preprocessor)
+
+    # Cross-validated scores
+    cv_table = {}
+    for name, pipe in models.items():
+        cv_table[name] = cv_scores(pipe, X_train, y_train)
+    print("CV SCORES:", cv_table)
+    save_json(cv_table, OUTPUT_DIR / "metrics_cv.json")
+
+    # Hold-out evaluation
+    holdout = evaluate_holdout(models, X_test, y_test)
+    save_json(holdout, OUTPUT_DIR / "metrics_holdout.json")
+
+    # Plot ROC curves
+    plot_rocs(models, X_test, y_test, FIG_DIR / "roc_curves.png")
+
+    # Confusion matrices
+    for name, _ in models.items():
+        from sklearn.metrics import confusion_matrix
+        y_pred = models[name].predict(X_test)
+        cm = confusion_matrix(y_test, y_pred)
+        plot_confusion_matrix(cm, labels=("Legitimate(0)","Phishing(1)"), out_path=FIG_DIR / f"cm_{name}.png")
+
+    # Pick best model by AUC (fallback to F1 if AUC missing)
+    def get_auc(d): return d.get("roc", {}).get("auc", None)
+    aucs = {k: get_auc(v) for k, v in holdout.items()}
+    if all(v is None for v in aucs.values()):
+        # fallback: choose max F1
+        f1s = {k: v["report"]["weighted avg"]["f1-score"] for k, v in holdout.items()}
+        best_name = max(f1s, key=f1s.get)
+    else:
+        best_name = max({k:v for k,v in aucs.items() if v is not None}, key=lambda k: aucs[k])
+
+    best_model = models[best_name]
+    print(f"Best model: {best_name}")
+
+    # Threshold tuning plot for best model
+    if hasattr(best_model, "predict_proba"):
+        plot_precision_recall_thresholds(best_model, X_test, y_test, FIG_DIR / "precision_recall_threshold.png")
+
+    # Save model artifact
+    joblib.dump(best_model, ARTIFACTS_DIR / f"model_{best_name}.pkl")
+
+    preds = best_model.predict(X_test)
+    probs = best_model.predict_proba(X_test)[:,1]
+    df_out = X_test.copy()
+    df_out["y_true"] = y_test.values
+    df_out["y_pred"] = preds
+    df_out["p_phish"] = probs
+    df_out.to_csv(OUTPUT_DIR / "test_predictions.csv", index=False)
+
+    # Save feature names (post-preprocessing input order == original numeric order)
+    feature_names = X_train.columns.tolist()
+    save_json({"features": feature_names}, ARTIFACTS_DIR / "feature_names.json")
+
+    # Decision Tree rule dump (if DT trained)
+    if "DecTree" in models:
+        rules = tree_rules_text(models["DecTree"], feature_names)
+        (ARTIFACTS_DIR / "rules_decision_tree.txt").write_text(rules, encoding="utf-8")
+
+    # SHAP explanations (best model)
+    # Use a small sample to keep plots snappy
+    sample_idx = np.random.RandomState(RANDOM_STATE).choice(len(X_test), size=min(500, len(X_test)), replace=False)
+    shap_summary_plots(best_name, best_model, X_test.iloc[sample_idx], FIG_DIR / "shap")
+    shap_single_waterfalls(best_model, X_test, y_test, FIG_DIR / "shap_instance")
+
+    # Final console tips
+    print("\nArtifacts saved to:", OUTPUT_DIR.resolve())
+    print(" - metrics_cv.json, metrics_holdout.json")
+    print(" - figures: roc_curves.png, cm_*.png, precision_recall_threshold.png, shap_*.png")
+    print(" - artifacts: model_*.pkl, feature_names.json, rules_decision_tree.txt (for DecTree)")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+-----modeling.py file
+
+from typing import Dict, Tuple
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier, export_text
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.metrics import make_scorer, accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from .config import RANDOM_STATE, N_FOLDS, N_JOBS
+
+def build_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
+    # All features are numeric in this dataset → scaling helps LR,
+    # trees/forest are robust either way. scaling id done through a ColumnTransformer.
+    numeric_features = X.columns.tolist()
+    numeric_transformer = Pipeline(steps=[("scaler", StandardScaler(with_mean=True, with_std=True))])
+    preprocessor = ColumnTransformer(
+        transformers=[("num", numeric_transformer, numeric_features)],
+        remainder="drop"
+    )
+    return preprocessor
+
+def build_models() -> Dict[str, Pipeline]:
+    # LR benefits from scaling; DT/RF can also run with scaled inputs (harmless).
+    lr = LogisticRegression(
+        penalty="l2", C=1.0, solver="liblinear", random_state=RANDOM_STATE
+    )
+    dt = DecisionTreeClassifier(
+        max_depth=None, min_samples_split=2, min_samples_leaf=1, random_state=RANDOM_STATE
+    )
+    rf = RandomForestClassifier(
+        n_estimators=300, max_depth=None, random_state=RANDOM_STATE, n_jobs=N_JOBS
+    )
+    return {"LogReg": lr, "DecTree": dt, "RandForest": rf}
+
+def cv_scores(model: Pipeline, X: pd.DataFrame, y: pd.Series) -> Dict[str, float]:
+    scorers = {
+        "accuracy": make_scorer(accuracy_score),
+        "precision": make_scorer(precision_score),
+        "recall": make_scorer(recall_score),
+        "f1": make_scorer(f1_score),
+        "roc_auc": make_scorer(roc_auc_score)
+    }
+    cv = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    out = cross_validate(model, X, y, scoring=scorers, cv=cv, n_jobs=N_JOBS, return_train_score=False)
+    return {k: float(np.mean(v)) for k, v in out.items() if k.startswith("test_")}
+
+def fit_all(X_train: pd.DataFrame, y_train: pd.Series, preprocessor: ColumnTransformer) -> Dict[str, Pipeline]:
+    models = build_models()
+    fitted = {}
+    for name, clf in models.items():
+        pipe = Pipeline(steps=[("prep", preprocessor), ("clf", clf)])
+        pipe.fit(X_train, y_train)
+        fitted[name] = pipe
+    return fitted
+
+def tree_rules_text(decision_tree_pipe: Pipeline, feature_names: list) -> str:
+    # Extract rules from the inner DecisionTreeClassifier
+    from sklearn.tree import DecisionTreeClassifier
+    clf = decision_tree_pipe.named_steps["clf"]
+    assert isinstance(clf, DecisionTreeClassifier)
+    # After scaling, feature order equals given feature_names
+    return export_text(clf, feature_names=list(feature_names))
+
+
+
+
+-----predict_demo.py
+
+from pathlib import Path
+import joblib, json
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+MODEL = ROOT / "outputs" / "artifacts" / "model_RandForest.pkl"
+DATA = ROOT / "data" / "raw" / "Phishing_Legitimate_full.csv"
+
+pipe = joblib.load(MODEL)
+df = pd.read_csv(DATA)
+
+X = df.drop(columns=["CLASS_LABEL"])
+y = df["CLASS_LABEL"]
+
+sample = X.sample(n=5, random_state=7)
+proba = pipe.predict_proba(sample)[:, 1]
+pred = (proba >= 0.5).astype(int)
+
+out = sample.copy()
+out["pred_phish"] = pred
+out["prob_phish"] = proba.round(4)
+print(out)
+
+
+
+
+-----url_features.py file
+
+
+# src/url_features.py
+from __future__ import annotations
+from typing import Dict, List
+import re
+import socket
+from urllib.parse import urlparse, urlsplit, parse_qs
+
+import requests
+from bs4 import BeautifulSoup
+
+SENSITIVE_WORDS = [
+    "login", "secure", "account", "update", "verify",
+    "bank", "password", "signin", "security"
+]
+
+BRAND_WORDS = [
+    "paypal", "amazon", "google", "microsoft", "apple",
+    "bankofamerica", "hsbc", "barclays", "netflix"
+]
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0 Safari/537.36"
+)
+
+
+class PageUnavailable(Exception):
+    """Raised when a URL cannot be fetched or parsed."""
+
+
+def _is_ip(host: str) -> int:
+    try:
+        socket.inet_aton(host)
+        return 1
+    except OSError:
+        return 0
+
+
+def _random_string_score(host: str) -> int:
+    s = re.sub(r"[^a-z0-9]", "", host.lower())
+    if len(s) >= 12 and re.search(r"[0-9]", s) and not re.search(r"(bank|mail|login|account)", s):
+        return 1
+    return 0
+
+
+def _count_subdomain_level(host: str) -> int:
+    parts = host.split(".")
+    return max(len(parts) - 2, 0)
+
+
+def _count_path_level(path: str) -> int:
+    return len([p for p in path.split("/") if p])
+
+
+def _pct_external(links: List[str], base_netloc: str) -> float:
+    if not links:
+        return 0.0
+    ext = 0
+    tot = 0
+    for href in links:
+        href = (href or "").strip()
+        if not href:
+            continue
+        tot += 1
+        parsed = urlparse(href)
+        if parsed.netloc and parsed.netloc != base_netloc:
+            ext += 1
+    if tot == 0:
+        return 0.0
+    return 100.0 * ext / tot
+
+
+def _try_get(url: str):
+    """Try to fetch a URL in a robust way (http/https, SSL off)."""
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=15,
+            allow_redirects=True,
+            verify=False,  # tolerate SSL issues
+        )
+        return resp
+    except Exception as e:
+        raise PageUnavailable(str(e))
+
+
+def _get_soup(url: str):
+    """
+    Try fetching with given scheme, then switch between http/https
+    if the first attempt fails or returns 4xx/5xx.
+    """
+    resp = _try_get(url)
+
+    if resp.status_code >= 400:
+        # Flip scheme and try again (http <-> https)
+        parsed = urlsplit(url)
+        if parsed.scheme == "https":
+            alt = url.replace("https://", "http://", 1)
+        elif parsed.scheme == "http":
+            alt = url.replace("http://", "https://", 1)
+        else:
+            alt = "https://" + url.lstrip("/")
+        resp = _try_get(alt)
+
+    if resp.status_code >= 400:
+        raise PageUnavailable(f"HTTP {resp.status_code}")
+
+    return resp.url, BeautifulSoup(resp.text, "html.parser")
+
+
+def extract_features_from_url(url: str) -> Dict[str, float]:
+    """
+    Fetches the URL, parses the HTML + URL structure, and returns a dict of
+    48 features with the same names as the training dataset.
+
+    Raises PageUnavailable if the page cannot be reached.
+    """
+    final_url, soup = _get_soup(url)
+    parsed = urlparse(final_url)
+
+    host = parsed.hostname or ""
+    path = parsed.path or ""
+    query = parsed.query or ""
+
+    full = final_url
+    num_dots = full.count(".")
+    num_dash = full.count("-")
+    num_dash_host = host.count("-") if host else 0
+    num_at = full.count("@")
+    num_tilde = full.count("~")
+    num_underscore = full.count("_")
+    num_percent = full.count("%")
+    num_qcomp = len(parse_qs(query))
+    num_amp = full.count("&")
+    num_hash = full.count("#")
+    num_numeric = len(re.findall(r"\d", full))
+    no_https = 0 if parsed.scheme == "https" else 1
+    random_string = _random_string_score(host)
+    ip_address = _is_ip(host)
+    domain_in_sub = 1 if any(b in (parsed.netloc.split(".")[0].lower()) for b in BRAND_WORDS) else 0
+    domain_in_paths = 1 if any(b in path.lower() for b in BRAND_WORDS) else 0
+    https_in_host = 1 if "https" in host.lower() else 0
+    host_len = len(host)
+    path_len = len(path)
+    query_len = len(query)
+    double_slash_in_path = 1 if "//" in path else 0
+
+    # HTML-based
+    all_a = soup.find_all("a")
+    links = [a.get("href", "") for a in all_a]
+    pct_ext_hyper = _pct_external(links, parsed.netloc)
+
+    res_urls = []
+    for tag in soup.find_all(["img", "script", "link"]):
+        href = tag.get("src") or tag.get("href")
+        if href:
+            res_urls.append(href)
+    pct_ext_res = _pct_external(res_urls, parsed.netloc)
+
+    # favicon
+    ext_favicon = 0
+    for link in soup.find_all("link", rel=lambda v: v and "icon" in v.lower()):
+        href = link.get("href", "")
+        if href:
+            fav_parsed = urlparse(href)
+            if fav_parsed.netloc and fav_parsed.netloc != parsed.netloc:
+                ext_favicon = 1
+                break
+
+    # forms
+    forms = soup.find_all("form")
+    insecure_forms = 0
+    relative_form_action = 0
+    ext_form_action = 0
+    abnormal_form_action = 0
+    for form in forms:
+        action = (form.get("action") or "").strip()
+        if not action:
+            abnormal_form_action = 1
+            continue
+        act_parsed = urlparse(action)
+        if not act_parsed.scheme:
+            relative_form_action = 1
+        elif act_parsed.scheme == "http":
+            insecure_forms = 1
+        if act_parsed.netloc and act_parsed.netloc != parsed.netloc:
+            ext_form_action = 1
+
+    # "null self-redirect" links
+    null_self_redirect = 0
+    ext_null_self_redirect = 0
+    for a in all_a:
+        href = (a.get("href") or "").strip().lower()
+        if not href or href in ("#", "javascript:void(0)", "javascript:;"):
+            null_self_redirect += 1
+        else:
+            par = urlparse(href)
+            if par.netloc and par.netloc != parsed.netloc:
+                ext_null_self_redirect += 1
+
+    total_links = max(len(all_a), 1)
+    pct_null_self = 100.0 * null_self_redirect / total_links
+    pct_ext_null_self = 100.0 * ext_null_self_redirect / total_links
+
+    # sensitive / brand words
+    text = soup.get_text(" ", strip=True).lower()
+    num_sensitive = sum(1 for w in SENSITIVE_WORDS if w in text)
+    embedded_brand = 1 if any(b in text for b in BRAND_WORDS) else 0
+
+    frequent_domain_mismatch = 1 if "window.location" in soup.text else 0
+    fake_link_statusbar = 1 if "onmouseover" in soup.text.lower() else 0
+    right_click_disabled = 1 if "contextmenu" in soup.text.lower() else 0
+    popup_window = 1 if "window.open(" in soup.text.lower() else 0
+    submit_to_email = 1 if "mailto:" in soup.text.lower() else 0
+
+    iframes = soup.find_all("iframe") or soup.find_all("frame")
+    iframe_or_frame = 1 if iframes else 0
+    missing_title = 1 if not soup.title or not (soup.title.string and soup.title.string.strip()) else 0
+    images_only_form = 1 if forms and all(
+        len(form.find_all("input", type=lambda v: v != "image")) == 0 for form in forms
+    ) else 0
+
+    subdomain_level = _count_subdomain_level(host)
+    path_level = _count_path_level(path)
+
+    features = {
+        "NumDots": num_dots,
+        "SubdomainLevel": subdomain_level,
+        "PathLevel": path_level,
+        "UrlLength": len(full),
+        "NumDash": num_dash,
+        "NumDashInHostname": num_dash_host,
+        "AtSymbol": num_at,
+        "TildeSymbol": num_tilde,
+        "NumUnderscore": num_underscore,
+        "NumPercent": num_percent,
+        "NumQueryComponents": num_qcomp,
+        "NumAmpersand": num_amp,
+        "NumHash": num_hash,
+        "NumNumericChars": num_numeric,
+        "NoHttps": no_https,
+        "RandomString": random_string,
+        "IpAddress": ip_address,
+        "DomainInSubdomains": domain_in_sub,
+        "DomainInPaths": domain_in_paths,
+        "HttpsInHostname": https_in_host,
+        "HostnameLength": host_len,
+        "PathLength": path_len,
+        "QueryLength": query_len,
+        "DoubleSlashInPath": double_slash_in_path,
+        "NumSensitiveWords": num_sensitive,
+        "EmbeddedBrandName": embedded_brand,
+        "PctExtHyperlinks": pct_ext_hyper,
+        "PctExtResourceUrls": pct_ext_res,
+        "ExtFavicon": ext_favicon,
+        "InsecureForms": insecure_forms,
+        "RelativeFormAction": relative_form_action,
+        "ExtFormAction": ext_form_action,
+        "AbnormalFormAction": abnormal_form_action,
+        "PctNullSelfRedirectHyperlinks": pct_null_self,
+        "FrequentDomainNameMismatch": frequent_domain_mismatch,
+        "FakeLinkInStatusBar": fake_link_statusbar,
+        "RightClickDisabled": right_click_disabled,
+        "PopUpWindow": popup_window,
+        "SubmitInfoToEmail": submit_to_email,
+        "IframeOrFrame": iframe_or_frame,
+        "MissingTitle": missing_title,
+        "ImagesOnlyInForm": images_only_form,
+        "SubdomainLevelRT": float(subdomain_level),
+        "UrlLengthRT": float(len(full)),
+        "PctExtResourceUrlsRT": pct_ext_res,
+        "AbnormalExtFormActionR": float(abnormal_form_action),
+        "ExtMetaScriptLinkRT": 0.0,  # not easily recoverable
+        "PctExtNullSelfRedirectHyperlinksRT": pct_ext_null_self,
+    }
+
+    return features
+
+
+
+
+
+-----utils.py file
+
+# src/utils.py
+from pathlib import Path
+import json
+
+def ensure_dir(p: Path) -> None:
+    """Create directory p (and parents) if it doesn't exist."""
+    p.mkdir(parents=True, exist_ok=True)
+
+def save_json(obj, path: Path) -> None:
+    """Save a Python object as pretty JSON to path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+
+
+
+
+-----app.py file
+
+from pathlib import Path
+import json
+
+import pandas as pd
+import joblib
+from flask import Flask, render_template, request, redirect, url_for, flash
+
+from src.url_features import extract_features_from_url, PageUnavailable
+
+ROOT = Path(__file__).resolve().parent
+ARTIFACTS_DIR = ROOT / "outputs" / "artifacts"
+MODEL_PATH = ARTIFACTS_DIR / "model_RandForest.pkl"
+FEATURES_PATH = ARTIFACTS_DIR / "feature_names.json"
+
+if not MODEL_PATH.exists():
+    raise FileNotFoundError(
+        f"Model not found at {MODEL_PATH}. "
+        "Run `python -m src.main` first to train and save the model."
+    )
+
+if not FEATURES_PATH.exists():
+    raise FileNotFoundError(
+        f"Feature names file not found at {FEATURES_PATH}. "
+        "Run `python -m src.main` first to generate feature_names.json."
+    )
+
+# Load trained pipeline (preprocessor + RandomForest)
+pipe = joblib.load(MODEL_PATH)
+
+with FEATURES_PATH.open("r", encoding="utf-8") as f:
+    feature_names = json.load(f)["features"]
+
+TARGET_COL = "CLASS_LABEL"
+
+app = Flask(__name__)
+app.secret_key = "change-this-secret-key"
+
+
+@app.route("/")
+def home():
+    return render_template("home.html", feature_names=feature_names)
+
+# SINGLE URL TEST
+@app.route("/single", methods=["GET", "POST"])
+def single():
+    prediction = None
+    prob_phish = None
+    url = None
+    feature_preview = None
+    page_available = None
+
+    if request.method == "POST":
+        url = request.form.get("url", "").strip()
+        if not url:
+            flash("Please enter a URL.", "error")
+            return redirect(url_for("single"))
+
+        if not url.lower().startswith(("http://", "https://")):
+            url = "http://" + url
+
+        try:
+            feats = extract_features_from_url(url)
+            page_available = True
+        except PageUnavailable as e:
+            page_available = False
+            flash(f"Page not available or could not be fetched: {e}", "error")
+            feats = None
+
+        if feats is not None:
+            row = {f: feats.get(f, 0.0) for f in feature_names}
+            X = pd.DataFrame([row])
+            proba = pipe.predict_proba(X)[:, 1][0]
+            pred = int(proba >= 0.5)
+
+            prediction = pred
+            prob_phish = float(proba)
+            feature_preview = row
+
+    return render_template(
+        "single.html",
+        prediction=prediction,
+        prob_phish=prob_phish,
+        url=url,
+        page_available=page_available,
+        feature_preview=feature_preview,
+    )
+
+# BATCH CSV TEST
+@app.route("/batch", methods=["GET", "POST"])
+def batch():
+    summary = None
+    preview = []
+    preview_cols = []
+
+    if request.method == "POST":
+        file = request.files.get("file")
+        if not file or file.filename == "":
+            flash("Please select a CSV file.", "error")
+            return redirect(url_for("batch"))
+
+        try:
+            df = pd.read_csv(file)
+        except Exception as e:
+            flash(f"Could not read CSV file: {e}", "error")
+            return redirect(url_for("batch"))
+
+        cols_in_file = list(df.columns)
+        missing = [c for c in feature_names if c not in df.columns]
+
+        if missing:
+            flash(
+                "Warning: Some required feature columns are missing; they were filled with 0.0.",
+                "error",
+            )
+            for c in missing:
+                df[c] = 0.0
+
+        X = df[feature_names]
+
+        proba = pipe.predict_proba(X)[:, 1]
+        pred = (proba >= 0.5).astype(int)
+
+        df_out = df.copy()
+        df_out["pred_phish"] = pred
+        df_out["prob_phish"] = proba.round(4)
+
+        acc = None
+        if TARGET_COL in df.columns:
+            from sklearn.metrics import accuracy_score
+
+            acc = float(accuracy_score(df[TARGET_COL], pred))
+
+        summary = {
+            "n_rows": len(df),
+            "columns": cols_in_file,
+            "missing": missing,
+            "accuracy": acc,
+        }
+
+        # show EVERY row, with a readable label used by the template
+        preview = df_out.to_dict(orient="records")
+        preview_cols = list(df_out.columns) + ["prediction_label"]
+        for row in preview:
+            row["prediction_label"] = (
+                "Non legitimate (Phishing)" if row["pred_phish"] == 1 else "Legitimate"
+            )
+
+    return render_template(
+        "batch.html",
+        summary=summary,
+        preview=preview,
+        preview_cols=preview_cols,
+    )
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+
+
+
+-----make_sample_500.py file
+
+import pandas as pd
+from pathlib import Path
+
+# Path to the raw dataset
+DATA_PATH = Path("data") / "raw" / "Phishing_Legitimate_full.csv"
+
+def main():
+    # Load full dataset
+    df = pd.read_csv(DATA_PATH)
+
+    # Validate label column
+    if "CLASS_LABEL" not in df.columns:
+        raise ValueError("Expected a CLASS_LABEL column in the dataset")
+
+    # Number per class
+    n_per_class = 250
+
+    # Stratified sampling (250 per class)
+    df_sample = (
+        df.groupby("CLASS_LABEL", group_keys=False)
+          .apply(lambda x: x.sample(n=n_per_class, random_state=42))
+          .reset_index(drop=True)
+    )
+
+    # Shuffle the combined 500 rows
+    df_sample = df_sample.sample(frac=1.0, random_state=99).reset_index(drop=True)
+
+    # Display info
+    print("Original class balance:")
+    print(df["CLASS_LABEL"].value_counts())
+
+    print("\nFinal sample class balance (shuffled):")
+    print(df_sample["CLASS_LABEL"].value_counts())
+
+    # Save final mixed dataset
+    out_path = Path("data") / "Phishing_Legitimate_sample_500.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df_sample.to_csv(out_path, index=False)
+
+    print(f"\nSaved mixed 500-row sample to:\n{out_path.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+-----make_url_sample_500.py file
+
+import pandas as pd
+from pathlib import Path
+
+# Path to the URL list
+DATA_PATH = Path("data") / "raw" / "phishing_site_urls.csv"
+
+def main():
+    # Load URL list
+    df = pd.read_csv(DATA_PATH)
+
+    # Detect the column name that contains URLs
+    # If file uses a different column name, change here.
+    possible_cols = ["url", "URL", "site", "link", "phishing_url"]
+    url_col = None
+
+    for col in df.columns:
+        if col.lower() in [c.lower() for c in possible_cols]:
+            url_col = col
+            break
+
+    if url_col is None:
+        raise ValueError(
+            f"Could not detect URL column automatically. "
+            f"Columns in file: {list(df.columns)}"
+        )
+
+    print(f"Detected URL column: {url_col}")
+
+    # Ensure at least 500 entries exist
+    if len(df) < 500:
+        raise ValueError(
+            f"Dataset contains only {len(df)} rows. Cannot sample 500 URLs."
+        )
+
+    # Shuffle entire dataset
+    df_shuffled = df.sample(frac=1.0, random_state=123).reset_index(drop=True)
+
+    # Take first 500 rows
+    df_sample = df_shuffled.head(500)
+
+    # Save output
+    out_path = Path("data") / "phishing_url_sample_500.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df_sample.to_csv(out_path, index=False)
+
+    print(f"Saved 500 random URLs to: {out_path.resolve()}")
+    print(f"Preview:\n{df_sample.head()}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+-----base.html file
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Phishing Email Classifier</title>
+   <style>
+    body { font-family: Arial, sans-serif; max-width: 960px; margin: 40px auto; }
+    h1, h2, h3 { color: #333; }
+    nav a { margin-right: 12px; }
+    .alert { padding: 8px 12px; border-radius: 4px; margin-bottom: 12px; }
+    .alert-error { background: #ffe5e5; color: #900; }
+    .alert-success { background: #e5ffe5; color: #060; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; font-size: 0.9rem; }
+    th { background: #f4f4f4; text-align: left; }
+    input[type=number], input[type=text] { width: 320px; }
+    .btn { padding: 6px 12px; border-radius: 3px; border: 1px solid #007bff;
+           background: #007bff; color: #fff; cursor: pointer; }
+    .badge { padding: 3px 7px; border-radius: 3px; font-size: 0.85rem; }
+    .badge-ok { background: #28a745; color: #fff; }
+    .badge-bad { background: #dc3545; color: #fff; }
+    .row-phish { background: #ffe5e5; }
+    .row-legit { background: #e5ffe5; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="{{ url_for('home') }}">Home</a>
+    <a href="{{ url_for('single') }}">Single Sample</a>
+    <a href="{{ url_for('batch') }}">Batch CSV Upload</a>
+  </nav>
+  <hr>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for cat, msg in messages %}
+        <div class="alert {% if cat == 'error' %}alert-error{% else %}alert-success{% endif %}">
+          {{ msg }}
+        </div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  {% block content %}{% endblock %}
+</body>
+</html>
+
+
+
+
+
+-----batch.html file
+
+{% extends "base.html" %}
+{% block content %}
+<h2>Batch CSV Upload</h2>
+<p>
+Upload a CSV file with the same 48 feature columns used for training.
+If <code>CLASS_LABEL</code> is present, accuracy will also be reported.
+Rows predicted as <strong>Non legitimate (Phishing)</strong> are highlighted in red; 
+<strong>Legitimate</strong> rows are highlighted in green.
+</p>
+
+<form method="post" enctype="multipart/form-data">
+  <p>
+    <input type="file" name="file" accept=".csv">
+    <button type="submit" class="btn">Upload &amp; Predict</button>
+  </p>
+</form>
+
+{% if summary %}
+  <h3>Summary</h3>
+  <p>Total rows processed: <strong>{{ summary.n_rows }}</strong></p>
+  <p>Columns in file: {{ summary.columns|join(", ") }}</p>
+  {% if summary.missing %}
+    <p><strong>Missing required feature columns (filled with 0.0):</strong> {{ summary.missing|join(", ") }}</p>
+  {% endif %}
+  {% if summary.accuracy is not none %}
+    <p>Accuracy vs. CLASS_LABEL: <strong>{{ (summary.accuracy*100)|round(2) }}%</strong></p>
+  {% endif %}
+
+  <h3>Preview of Predictions</h3>
+  <table>
+    <tr>
+      {% for col in preview_cols %}
+        <th>{{ col }}</th>
+      {% endfor %}
+    </tr>
+    {% for row in preview %}
+      <tr class="{% if row['pred_phish'] == 1 %}row-phish{% else %}row-legit{% endif %}">
+        {% for col in preview_cols %}
+          <td>
+            {% if col == 'prediction_label' %}
+              {% if row['pred_phish'] == 1 %}
+                Non legitimate (Phishing)
+              {% else %}
+                Legitimate
+              {% endif %}
+            {% else %}
+              {{ row[col] }}
+            {% endif %}
+          </td>
+        {% endfor %}
+      </tr>
+    {% endfor %}
+  </table>
+{% endif %}
+{% endblock %}
+
+
+
+
+
+-----home.html file
+
+{% extends "base.html" %}
+{% block content %}
+<h1>Phishing Email Classifier – Web Demo</h1>
+<p>
+This interface uses the trained Random Forest model to classify samples as
+<strong>Phishing (1)</strong> or <strong>Legitimate (0)</strong> based on the engineered features.
+</p>
+<ul>
+  <li><a href="{{ url_for('single') }}">Test a single sample manually</a></li>
+  <li><a href="{{ url_for('batch') }}">Upload a CSV file for batch testing</a></li>
+</ul>
+<p>
+Your model currently expects <strong>{{ feature_names|length }}</strong> numeric features.
+The label column <code>CLASS_LABEL</code> is optional in batch mode.
+</p>
+{% endblock %}
+
+
+
+
+
+-----single.html file
+
+{% extends "base.html" %}
+{% block content %}
+<h2>Single URL Test</h2>
+<p>
+Paste a URL below. The system will fetch the page, compute the 48 engineered features,
+and classify it as <strong>Legitimate</strong> or <strong>Non legitimate (Phishing)</strong>.
+If the page cannot be reached, you will be informed.
+</p>
+
+<form method="post">
+  <p>
+    <label for="url"><strong>URL:</strong></label><br>
+    <input type="text" id="url" name="url" placeholder="https://example.com" value="{{ url or '' }}">
+    <button type="submit" class="btn">Check</button>
+  </p>
+</form>
+
+{% if page_available is not none %}
+  {% if not page_available %}
+    <p><strong>Result:</strong> Page not available or could not be fetched.</p>
+  {% elif prediction is not none %}
+    <h3>Result</h3>
+    <p>
+      URL: <code>{{ url }}</code><br>
+      Predicted label:
+      {% if prediction == 1 %}
+        <span class="badge badge-bad">Non legitimate (Phishing)</span>
+      {% else %}
+        <span class="badge badge-ok">Legitimate</span>
+      {% endif %}
+      &nbsp; | &nbsp;
+      Probability of phishing: <strong>{{ prob_phish|round(4) }}</strong>
+    </p>
+
+    {% if feature_preview %}
+      <h3>Feature Snapshot (subset)</h3>
+      <table>
+        <tr><th>Feature</th><th>Value</th></tr>
+        {% for name, val in feature_preview.items() %}
+          <tr><td>{{ name }}</td><td>{{ val }}</td></tr>
+        {% endfor %}
+      </table>
+    {% endif %}
+  {% endif %}
+{% endif %}
+{% endblock %}
+
